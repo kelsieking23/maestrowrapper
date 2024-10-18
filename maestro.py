@@ -64,14 +64,7 @@ class MaestroWrapper:
     @property
     def num_pending(self):
         return len(self.pending_jobs)
-    # @property
-    # def queue_ready(self):
-    #     if len(self.pending_jobs) == 0:
-    #         return False
-    #     elif self.num_active == 4:
-    #         return False
-    #     else:
-    #         return True
+
 
     def divide_files(self, n):
         # Calculate the target size of each smaller list
@@ -180,6 +173,60 @@ class MaestroWrapper:
             running_jobs = 0
         return 0
     
+    def ligprep(self, output_type='sd', nt=4, export_to='ligprep', options = [], kwarg_options= {}):
+        path = os.path.join(os.path.dirname(self.path), export_to)
+        if not os.path.isdir(path):
+            os.mkdir(path)
+        os.chdir(path)
+        jobs = self.divide_files(nt)
+        job_params = []
+        for job_index, files in enumerate(jobs):
+            tmpdir = 'ligprep{}'.format(job_index)
+            subjob_params = {
+                'job_id':job_index,
+                'files':[os.path.join(self.path, file) for file in files],
+                'cmds':[],
+                'tmpdir':tmpdir,
+                'lic':'LIGPREP_MAIN'
+            }
+            if not os.path.isdir(tmpdir):
+                os.mkdir(tmpdir)
+            for file in files:
+                basename, ext = os.path.splitext(os.path.basename(file))
+                inp_option = '-i{}'.format(ext[1:])
+                out_option = '-o{}'.format(output_type)
+                out_file = '{}{}'.format(basename, '.{}'.format(output_type))
+                cmd = f'ligprep -HOST localhost:12 {inp_option} {file} {out_option} {out_file}'
+                for option in options:
+                    cmd = cmd + ' {}'.format(option)
+                for k, v in kwarg_options.items():
+                    cmd = cmd + ' {} {}'.format(k, str(v))
+                subjob_params['cmds'].append(cmd)
+            print(subjob_params['cmds'][0])
+            job_params.append(subjob_params)
+        print('There are {} subjobs'.format(nt))
+        tj = 0
+        for sj in job_params:
+            print('Subjob {} has {} jobs'.format(sj['job_id'], len(sj['files'])))
+            tj += len(sj['files'])
+        print('Total {} jobs to be completed.'.format(tj))
+        print('Launching ligprep job(s)...')
+        if nt > 1:
+            pool = mp.Pool(processes=nt)
+            results = pool.map(self.run_subjob, job_params)
+        else:
+            self.run_subjob(job_params[0])
+        print('ligprep complete.')
+        print('Cleaning...')
+        for job_param in job_params:
+            tmpdir = job_param['tmpdir']
+            for file in os.listdir(tmpdir):
+                src = os.path.join(tmpdir, file)
+                dest = os.path.join(path, file)
+                shutil.copy2(src, dest)
+                os.remove(src)
+            os.rmdir(tmpdir)
+
     @staticmethod
     def getPrepOut(file):
         base, _ = os.path.splitext(file)
@@ -198,7 +245,31 @@ class MaestroWrapper:
         process = subprocess.Popen(cmd.split(), shell=False, stdout=None, stderr=None, env=environ)
         return pdb
     
-    def prepWizard(self, write_pdb=True, **kwargs):
+    def separate_mae(self, mae, basename=None, export_to=None):
+        n_structs = 0
+        with open(mae, 'r') as f:
+            lines = f.readlines()
+        for line in lines:
+            if line.startswith('f_m_ct'):
+                n_structs += 1
+        if export_to is None:
+            export_to = os.path.dirname(mae)
+        outs = []
+        for struct in range(1, n_structs+1):
+            cmd = 'maesubset -n {} {}'.format(struct, mae)
+            process = subprocess.Popen(cmd.split(), shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.environ)
+            stdout, stderr = process.communicate()
+            if basename is None:
+                base = os.path.splitext(os.path.basename(mae))[0]
+            else:
+                base = basename
+            out = os.path.join(export_to, '{}_{}.mae'.format(base, struct))
+            with open(out, 'w') as f:
+                f.write(stdout.decode())
+            outs.append(out)
+        return outs
+
+    def prepWizard(self, write_pdb=True, options=[], **kwargs):
         print('Starting PrepWizard on {} files...'.format(len(self.files)))
         _home = os.getcwd()
         os.chdir(self.path)
@@ -214,11 +285,15 @@ class MaestroWrapper:
                 'job_id':job_index,
                 'files':[os.path.join(self.path, file) for file in files],
                 'cmds':[],
-                'tmpdir':'prepwizard{}'.format(job_index)
+                'tmpdir':'prepwizard{}'.format(job_index),
+                'lic':'MAESTRO_MAIN'
             }
             temp_dirs.append('prepwizard{}'.format(job_index))
             for file in files:
-                subjob_params['cmds'].append('{} {} {}'.format(prepwizard_path, file, self.getPrepOut(file)))
+                cmd = '{} {} {}'.format(prepwizard_path, file, self.getPrepOut(file))
+                for option in options:
+                    cmd = cmd + ' {}'.format(option)
+                subjob_params['cmds'].append(cmd)
             job_params.append(subjob_params)
         pool = mp.Pool(processes=4)
         print('Launching...')
@@ -264,6 +339,35 @@ class MaestroWrapper:
         self._files = [file for file in os.listdir(self.path) if (file.startswith('prep')) and (file.endswith('mae'))]
         os.chdir(_home)
 
+    def concat(self, files=None, output='concat.mae'):
+        if files is None:
+            files = self.files
+        _home = os.getcwd()
+        if not _home == self.path:
+            os.chdir(self.path)
+        header = ['{' ,
+        's_m_m2io_version',
+        ':::',
+        '2.0.0 ',
+        '} ']
+        with open(output, 'w') as f:
+            for line in header:
+                f.write(f'{line}\n')
+            f.write('\n')
+            for file in files:
+                with open(file, 'r') as mae:
+                    contents = mae.readlines()
+                start = False
+                for line in contents:
+                    if line.startswith('f_m_ct {'):
+                        start = True
+                        f.write(line)
+                    elif start is False:
+                        continue
+                    else:
+                        f.write(line)
+        os.chdir(_home)
+
     def complex(self, files=None, protein='prep_protein.mae', export_to='complex'):
         _home = os.getcwd()
         os.chdir(self.path)
@@ -299,12 +403,62 @@ class MaestroWrapper:
             f.write(f'{k.upper()} {v} \n')
         f.close()
 
-    def primeMMGBSA(self, export_to='primeMMGBSA', schrod_kwargs={}):
+    def qikprop(self, export_to='qikprop', nt=4, options = []):
         path = os.path.join(os.path.dirname(self.path), export_to)
         if not os.path.isdir(path):
             os.mkdir(path)
         os.chdir(path)
-        jobs = self.divide_files(4)
+        jobs = self.divide_files(nt)
+        job_params = []
+        for job_index, files in enumerate(jobs):
+            tmpdir = 'primeMMGBSA{}'.format(job_index)
+            subjob_params = {
+                'job_id':job_index,
+                'files':[os.path.join(self.path, file) for file in files],
+                'cmds':[],
+                'tmpdir':tmpdir,
+                'lic':'QIKPROP_MAIN'
+            }
+            if not os.path.isdir(tmpdir):
+                os.mkdir(tmpdir)
+            for file in files:
+                cmd = f'qikprop -HOST localhost:12 {file}'
+                for option in options:
+                    if not option.startswith('-'):
+                        raise ValueError('needs to be a -flag')
+                    cmd = cmd + f' {option}'
+                subjob_params['cmds'].append(cmd)
+            job_params.append(subjob_params)
+        print('There are {} subjobs'.format(nt))
+        tj = 0
+        for sj in job_params:
+            print('Subjob {} has {} jobs'.format(sj['job_id'], len(sj['files'])))
+            tj += len(sj['files'])
+        print('Total {} jobs to be completed.'.format(tj))
+        print('Launching qikprop job(s)...')
+        if nt > 1:
+            pool = mp.Pool(processes=nt)
+            results = pool.map(self.run_subjob, job_params)
+        else:
+            self.run_subjob(job_params[0])
+        print('qikprop complete.')
+        print('Cleaning...')
+        for job_param in job_params:
+            tmpdir = job_param['tmpdir']
+            for file in os.listdir(tmpdir):
+                src = os.path.join(tmpdir, file)
+                dest = os.path.join(path, file)
+                shutil.copy2(src, dest)
+                os.remove(src)
+            os.rmdir(tmpdir)
+
+    def primeMMGBSA(self, export_to='primeMMGBSA', nt=4, schrod_kwargs={}):
+        path = os.path.join(self.path, export_to)
+
+        if not os.path.isdir(path):
+            os.mkdir(path)
+        os.chdir(path)
+        jobs = self.divide_files(nt)
         job_params = []
         for job_index, files in enumerate(jobs):
             tmpdir = 'primeMMGBSA{}'.format(job_index)
@@ -324,15 +478,18 @@ class MaestroWrapper:
                 cmd = f'prime_mmgbsa -HOST localhost:12 -prime_opt OPLS_VERSION=OPLS3e {os.path.basename(inp)}'
                 subjob_params['cmds'].append(cmd)
             job_params.append(subjob_params)
-        print('There are 4 subjobs')
+        print('There are {} subjobs'.format(nt))
         tj = 0
         for sj in job_params:
             print('Subjob {} has {} jobs'.format(sj['job_id'], len(sj['files'])))
             tj += len(sj['files'])
         print('Total {} jobs to be completed.'.format(tj))
-        pool = mp.Pool(processes=4)
-        print('Launching primeMMGBSA job...')
-        results = pool.map(self.run_subjob, job_params)
+        print('Launching primeMMGBSA job(s)...')
+        if nt > 1:
+            pool = mp.Pool(processes=nt)
+            results = pool.map(self.run_subjob, job_params)
+        else:
+            self.run_subjob(job_params[0])
         print('primeMMGBSA complete.')
         print('Cleaning...')
         for job_param in job_params:
@@ -415,3 +572,6 @@ class MaestroWrapper:
 
 
 
+# if __name__ == '__main__':
+#     mw = MaestroWrapper('D:/Schrodinger2022-3')
+#     mw.separate_mae('D:/Work/students/marion/inhibs_mmgbsa/docked_poses_mae/Title_K1_docking.mae')
